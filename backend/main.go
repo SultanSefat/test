@@ -1,54 +1,14 @@
 package main
-
-import (
-  "context"
-  "encoding/json"
-  "log"
-  "net/http"
-  "os"
-  "strings"
-  "time"
-
-  "github.com/redis/go-redis/v9"
-)
-
-var ctx = context.Background()
-var db *redis.Client
-
-type ChatRequest struct { SessionID string `json:"sessionId"`; Message string `json:"message"` }
-type ChatResponse struct { Answer string `json:"answer"`; Sources []string `json:"sources"` }
-
-func jsonOut(w http.ResponseWriter, v any) { w.Header().Set("Content-Type","application/json"); json.NewEncoder(w).Encode(v) }
-func main() {
-  addr := os.Getenv("REDIS_URL")
-  if addr == "" { addr = "localhost:6379" }
-  opt, err := redis.ParseURL("redis://" + addr)
-  if strings.Contains(addr, "://") { opt, err = redis.ParseURL(addr) }
-  if err != nil { opt = &redis.Options{Addr: addr} }
-  db = redis.NewClient(opt)
-  mux := http.NewServeMux()
-  mux.HandleFunc("/api/health", func(w http.ResponseWriter,r *http.Request){ jsonOut(w,map[string]string{"status":"ok"}) })
-  mux.HandleFunc("/api/knowledge", func(w http.ResponseWriter,r *http.Request){
-    if r.Method == http.MethodPost { var v map[string]string; if json.NewDecoder(r.Body).Decode(&v)==nil { db.Set(ctx,"knowledge",v["content"],0) }; jsonOut(w,map[string]bool{"ok":true}); return }
-    v,_ := db.Get(ctx,"knowledge").Result(); jsonOut(w,map[string]string{"content":v})
-  })
-  mux.HandleFunc("/api/chat", func(w http.ResponseWriter,r *http.Request){
-    var q ChatRequest
-    if json.NewDecoder(r.Body).Decode(&q)!=nil || strings.TrimSpace(q.Message)=="" { http.Error(w,"invalid request",400); return }
-    knowledge,_ := db.Get(ctx,"knowledge").Result()
-    answer := "I don't have verified information about that in the university materials yet. Please contact the admissions office for confirmation."
-    msg := strings.ToLower(q.Message)
-    if knowledge!="" {
-      terms := strings.Fields(msg); best := ""; score := 0
-      for _, p := range strings.Split(knowledge,"\n\n") { s:=0; for _,t:=range terms { if len(t)>3 && strings.Contains(strings.ToLower(p),t) { s++ } }; if s>score { score=s; best=p } }
-      if score>0 { answer=best }
-    }
-    if q.SessionID=="" { q.SessionID="default" }
-    b,_:=json.Marshal(map[string]string{"q":q.Message,"a":answer,"at":time.Now().Format(time.RFC3339)})
-    db.RPush(ctx,"history:"+q.SessionID,string(b))
-    jsonOut(w,ChatResponse{Answer:answer,Sources:[]string{}})
-  })
-  mux.HandleFunc("/api/history",func(w http.ResponseWriter,r *http.Request){ id:=r.URL.Query().Get("sessionId"); if id=="" {id="default"}; v,_:=db.LRange(ctx,"history:"+id,0,-1).Result(); jsonOut(w,v) })
-  port:=os.Getenv("PORT"); if port=="" {port="8080"}
-  log.Fatal(http.ListenAndServe(":"+port,mux))
-}
+import("bufio";"encoding/json";"fmt";"io";"log";"net";"net/http";"net/url";"os";"strconv";"strings";"time")
+type ChatRequest struct{SessionID string `json:"sessionId"`;Message string `json:"message"`}
+type ChatResponse struct{Answer string `json:"answer"`;Sources []string `json:"sources"`}
+var redisURL string
+func redisCommand(args ...string)(string,error){u,e:=url.Parse(redisURL);if e!=nil{return "",e};h:=u.Host;if !strings.Contains(h,":"){h+=":6379"};c,e:=net.DialTimeout("tcp",h,3*time.Second);if e!=nil{return "",e};defer c.Close();c.SetDeadline(time.Now().Add(4*time.Second));r:=bufio.NewReader(c);if u.User!=nil{pw,_:=u.User.Password();if pw!=""{if _,e=sendRedis(c,r,"AUTH",pw);e!=nil{return "",e}}};return sendRedis(c,r,args...)}
+func sendRedis(c net.Conn,r *bufio.Reader,args ...string)(string,error){var b strings.Builder;fmt.Fprintf(&b,"*%d\r\n",len(args));for _,a:=range args{fmt.Fprintf(&b,"$%d\r\n%s\r\n",len(a),a)};if _,e:=io.WriteString(c,b.String());e!=nil{return "",e};line,e:=r.ReadString('\n');if e!=nil{return "",e};line=strings.TrimSpace(line);if strings.HasPrefix(line,"-"){return "",fmt.Errorf("%s",line)};if strings.HasPrefix(line,"$"){n,_:=strconv.Atoi(line[1:]);if n<0{return "",nil};d:=make([]byte,n+2);_,e=io.ReadFull(r,d);return string(d[:n]),e};if strings.HasPrefix(line,"+")||strings.HasPrefix(line,":"){return line[1:],nil};return line,nil}
+func jsonOut(w http.ResponseWriter,v any){w.Header().Set("Content-Type","application/json");json.NewEncoder(w).Encode(v)}
+func main(){redisURL=os.Getenv("REDIS_URL");if redisURL==""{redisURL="redis://localhost:6379"};m:=http.NewServeMux()
+m.HandleFunc("/api/health",func(w http.ResponseWriter,r *http.Request){jsonOut(w,map[string]string{"status":"ok"})})
+m.HandleFunc("/api/knowledge",func(w http.ResponseWriter,r *http.Request){if r.Method==http.MethodPost{var v map[string]string;if json.NewDecoder(r.Body).Decode(&v)==nil{_,_=redisCommand("SET","knowledge",v["content"])};jsonOut(w,map[string]bool{"ok":true});return};v,_:=redisCommand("GET","knowledge");jsonOut(w,map[string]string{"content":v})})
+m.HandleFunc("/api/chat",func(w http.ResponseWriter,r *http.Request){var q ChatRequest;if json.NewDecoder(r.Body).Decode(&q)!=nil||strings.TrimSpace(q.Message)==""{http.Error(w,"invalid request",400);return};k,_:=redisCommand("GET","knowledge");a:="I don't have verified information about that in the university materials yet. Please contact the admissions office for confirmation.";if k!=""{best:="";score:=0;for _,p:=range strings.Split(k,"\n\n"){s:=0;for _,t:=range strings.Fields(strings.ToLower(q.Message)){if len(t)>3&&strings.Contains(strings.ToLower(p),t){s++}};if s>score{score=s;best=p}};if score>0{a=best}};if q.SessionID==""{q.SessionID="default"};b,_:=json.Marshal(map[string]string{"q":q.Message,"a":a,"at":time.Now().Format(time.RFC3339)});_,_=redisCommand("RPUSH","history:"+q.SessionID,string(b));jsonOut(w,ChatResponse{Answer:a,Sources:[]string{}})})
+m.HandleFunc("/api/history",func(w http.ResponseWriter,r *http.Request){id:=r.URL.Query().Get("sessionId");if id==""{id="default"};v,_:=redisCommand("LRANGE","history:"+id,"0","-1");jsonOut(w,[]string{v})})
+p:=os.Getenv("PORT");if p==""{p="8080"};log.Fatal(http.ListenAndServe(":"+p,m))}
